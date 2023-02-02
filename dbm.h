@@ -33,13 +33,25 @@
 #include "pie/pie-thumb-decoder.h"
 #endif
 
+#ifdef DBM_ARCH_RISCV64
+#include "scanner_public.h"
+#endif
+
 #include "common.h"
 #include "util.h"
+#include "mambo_logger.h"
 
 /* Various parameters which can be tuned */
 
+// Set program counter alignment
+#ifdef DBM_ARCH_RISCV64
+  // 16 bit compressed instructions relaxing the pc alignment
+  #define ARCH_BYTE_ALIGN 2
+#else
+  #define ARCH_BYTE_ALIGN 4
+#endif
 // BASIC_BLOCK_SIZE should be a power of 2
-#define BASIC_BLOCK_SIZE 64
+#define BASIC_BLOCK_SIZE 128 //TODO: Improve memory footprint by lowering to 64
 #ifdef DBM_TRACES
   #define CODE_CACHE_SIZE 55000
 #else
@@ -48,8 +60,12 @@
 #define TRACE_FRAGMENT_NO 60000
 #define CODE_CACHE_OVERP 30
 #define TRACE_FRAGMENT_OVERP 50
-#define MAX_BRANCH_RANGE (16*1024*1024)
-#define TRACE_CACHE_SIZE (MAX_BRANCH_RANGE - (CODE_CACHE_SIZE*BASIC_BLOCK_SIZE * 4))
+#ifdef DBM_ARCH_RISCV64
+  #define MAX_BRANCH_RANGE 0x100000
+#else
+  #define MAX_BRANCH_RANGE (16*1024*1024)
+#endif
+#define TRACE_CACHE_SIZE (MAX_BRANCH_RANGE - (CODE_CACHE_SIZE*BASIC_BLOCK_SIZE * ARCH_BYTE_ALIGN))
 #define TRACE_LIMIT_OFFSET (2*1024)
 
 #define TRACE_ALIGN 4 // must be a power of 2
@@ -66,7 +82,7 @@
 #define RAS_SIZE (4096*5)
 #define TBB_TARGET_REACHED_SIZE 30
 
-#define MAX_CC_LINKS 100000
+#define MAX_CC_LINKS 1000000
 
 #define THUMB 0x1
 #define FULLADDR 0x2
@@ -115,17 +131,30 @@ typedef enum {
   cond_imm_a64,
   cbz_a64,
   tbz_a64,
-  trace_exit
+  trace_exit,
 #endif // __aarch64__
+#ifdef DBM_ARCH_RISCV64
+  uncond_imm_riscv,
+  uncond_reg_riscv,
+  cond_imm_riscv
+#endif // DBM_ARCH_RISCV64
 } branch_type;
 
 typedef struct {
+#ifdef DBM_ARCH_RISCV64
+  uint16_t words[BASIC_BLOCK_SIZE];
+#else
   uint32_t words[BASIC_BLOCK_SIZE];
+#endif
 } dbm_block;
 
 typedef struct {
   dbm_block blocks[CODE_CACHE_SIZE];
+#ifdef DBM_TRACES
   uint8_t  traces[TRACE_CACHE_SIZE];
+#else
+  uint8_t traces[1]; // Array not used but the pointer which marks the end of `blocks`
+#endif
 } dbm_code_cache;
 
 #define FALLTHROUGH_LINKED (1 << 0)
@@ -142,12 +171,16 @@ typedef struct {
   uint16_t *exit_branch_addr;
 #endif // __arm__
 #ifdef __aarch64__
-  uint32_t *exit_branch_addr;
-#endif // __arch64__
-  uintptr_t branch_taken_addr;
-  uintptr_t branch_skipped_addr;
+  uint32_t *exit_branch_addr; /**< Beginning of the instrumented exit */
   uintptr_t branch_condition;
-  uintptr_t branch_cache_status;
+#endif // __arch64__
+#ifdef DBM_ARCH_RISCV64
+  uint16_t *exit_branch_addr; /**< Beginning of the instrumented exit */
+  mambo_cond branch_condition; /**< Exit branch condition */
+#endif // DBM_ARCH_RISCV64
+  uintptr_t branch_taken_addr; /**< Address of taken branch */
+  uintptr_t branch_skipped_addr; /**< Address of other branch taken */
+  uintptr_t branch_cache_status; /**< Linkage status */
   uint32_t rn;
   uint32_t free_b;
   ll_entry *linked_from;
@@ -231,6 +264,7 @@ typedef enum {
   ARM_INST,
   THUMB_INST,
   A64_INST,
+  RISCV64_INST,
 } inst_set;
 
 typedef enum {
@@ -306,6 +340,11 @@ extern void th_to_arm();
 extern void th_enter(void *stack, uintptr_t cc_addr);
 extern void send_self_signal();
 extern void syscall_wrapper_svc();
+#ifdef DBM_ARCH_RISCV64
+extern int* gp_tp_mambo_ctx;
+extern void* gp_shadow;
+extern void* tp_shadow;
+#endif
 
 int lock_thread_list(void);
 int unlock_thread_list(void);
@@ -326,7 +365,9 @@ size_t   scan_a64(dbm_thread *thread_data, uint32_t *read_address, int basic_blo
 int allocate_bb(dbm_thread *thread_data);
 void trace_dispatcher(uintptr_t target, uintptr_t *next_addr, uint32_t source_index, dbm_thread *thread_data);
 void flush_code_cache(dbm_thread *thread_data);
+#if defined(__arm__) || defined(__aarch64__)
 void insert_cond_exit_branch(dbm_code_cache_meta *bb_meta, void **o_write_p, int cond);
+#endif
 void sigret_dispatcher_call(dbm_thread *thread_data, ucontext_t *cont, uintptr_t target);
 
 void thumb_encode_stub_bb(dbm_thread *thread_data, int basic_block, uint32_t target);
@@ -428,6 +469,10 @@ int function_watch_add(watched_functions_t *self, char *name, int plugin_id,
   #define context_pc uc_mcontext.pc
   #define context_sp uc_mcontext.sp
   #define context_reg(reg) uc_mcontext.regs[reg]
+#elif DBM_ARCH_RISCV64
+  #define context_pc uc_mcontext.__gregs[REG_PC]
+  #define context_sp uc_mcontext.__gregs[REG_SP]
+  #define context_reg(reg) uc_mcontext.__gregs[reg]
 #endif
 
 #endif

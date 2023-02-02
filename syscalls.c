@@ -37,15 +37,9 @@
 #include "syscalls.h"
 
 #ifdef DEBUG
-  #define debug(...) fprintf(stderr, __VA_ARGS__)
+  #define debug(...) log("syscalls", __VA_ARGS__)
 #else
   #define debug(...)
-#endif
-
-#ifdef __aarch64__
-  #define SIG_FRAG_OFFSET 4
-#else
-  #define SIG_FRAG_OFFSET 0
 #endif
 
 void *dbm_start_thread_pth(void *ptr, void *mambo_sp) {
@@ -83,9 +77,29 @@ void *dbm_start_thread_pth(void *ptr, void *mambo_sp) {
   child_stack[33] = child_stack[1]; // X1
   child_stack += 2;
 #endif
+#ifdef DBM_ARCH_RISCV64
+  uint64_t *child_stack = thread_data->clone_args->child_stack;
+  /*
+   * // TODO: Rewrite for multithread support
+   * The `args` pointer passed to `syscall_handler_pre` points to the saved value of x10
+   * saved by push_volatile_syscall. Hence `args - 9` points to the value of x1 and `args + 21`
+   * to x31 accordingly. `dbm_create_thread` sets `thread_data->clone_args` to `args`
+   * before `dbm_start_thread_pth` is called, so the above also holds for 
+   * `thread_data->clone_args - 9` up to `thread_data->clone_args + 21`.
+   */
+  uint64_t *saved_stack = (uint64_t *)thread_data->clone_args - 9;
+  child_stack -= 33;
+  mambo_memcpy(child_stack, saved_stack, sizeof(uintptr_t) * 31);
+  mambo_memcpy(child_stack, saved_stack + 11, sizeof(uintptr_t) * 19);
+  // Add x10 and x11 at the bottom which are popped by code inserted by the scanner.
+  // x11 before x10 because `riscv_restore_regs` pops highest register first.
+  child_stack[32] = 0; // x10
+  child_stack[31] = saved_stack[10]; // x11
+#endif
 
   // Release the lock
-  asm volatile("DMB SY" ::: "memory");
+  // Full system memory barrier
+  __sync_synchronize();
   *(thread_data->set_tid) = tid;
 
   assert(register_thread(thread_data, false) == 0);
@@ -186,6 +200,11 @@ ssize_t readlink_handler(char *sys_path, char *sys_buf, ssize_t bufsize) {
 int syscall_handler_pre(uintptr_t syscall_no, uintptr_t *args, uint16_t *next_inst, dbm_thread *thread_data) {
   int do_syscall = 1;
   sys_clone_args *clone_args;
+#ifdef DBM_ARCH_RISCV64
+  uintptr_t *parent_stack = args - 4;
+#else
+  uintptr_t *parent_stack = args;
+#endif
   debug("syscall pre %d\n", syscall_no);
 
 #ifdef PLUGINS_NEW
@@ -221,7 +240,7 @@ int syscall_handler_pre(uintptr_t syscall_no, uintptr_t *args, uint16_t *next_in
         volatile pid_t child_tid = 0;
         dbm_create_thread(thread_data, next_inst, clone_args, &child_tid);
         while(child_tid == 0);
-        asm volatile("DMB SY" ::: "memory");
+        __sync_synchronize();
         args[0] = child_tid;
 
         do_syscall = 0;
@@ -238,12 +257,12 @@ int syscall_handler_pre(uintptr_t syscall_no, uintptr_t *args, uint16_t *next_in
       clone_args->flags &= ~CLONE_SETTLS;
 
       if (clone_args->child_stack != NULL) {
-        if (clone_args->child_stack == &args[SYSCALL_WRAPPER_STACK_OFFSET]) {
+        if (clone_args->child_stack == &parent_stack[SYSCALL_WRAPPER_STACK_OFFSET]) {
           clone_args->child_stack = NULL;
         } else {
           const size_t copy_size = SYSCALL_WRAPPER_FRAME_SIZE * sizeof(uintptr_t);
           clone_args->child_stack -= copy_size;
-          void *source = args + SYSCALL_WRAPPER_STACK_OFFSET - SYSCALL_WRAPPER_FRAME_SIZE;
+          void *source = parent_stack + SYSCALL_WRAPPER_STACK_OFFSET - SYSCALL_WRAPPER_FRAME_SIZE;
           mambo_memcpy(clone_args->child_stack, source, copy_size);
         }
       } // if child_stack != NULL
@@ -323,7 +342,7 @@ int syscall_handler_pre(uintptr_t syscall_no, uintptr_t *args, uint16_t *next_in
 #ifdef __arm__
     case __NR_mmap2: {
 #endif
-#ifdef __aarch64__
+#if defined(__aarch64__) || defined(DBM_ARCH_RISCV64)
     case __NR_mmap: {
 #endif
       uintptr_t syscall_ret, prot = args[2];
@@ -416,7 +435,7 @@ int syscall_handler_pre(uintptr_t syscall_no, uintptr_t *args, uint16_t *next_in
     case __NR_sigreturn:
 #endif
     case __NR_rt_sigreturn: {
-      void *app_sp = args;
+      void *app_sp = parent_stack;
 #ifdef __arm__
       /* We force all signal handler to the SA_SIGINFO type, which must return
          with rt_sigreturn() and not sigreturn(). Some applications don't return
@@ -428,6 +447,8 @@ int syscall_handler_pre(uintptr_t syscall_no, uintptr_t *args, uint16_t *next_in
       app_sp += 64;
 #elif __aarch64__
       app_sp += 64 + 144;
+#elif DBM_ARCH_RISCV64
+      app_sp += 20 * 8;     // +3 pushed by scanner +17 push_volatile_syscall
 #endif
       ucontext_t *cont = (ucontext_t *)(app_sp + sizeof(siginfo_t));
       sigret_dispatcher_call(thread_data, cont, cont->context_pc);
@@ -465,6 +486,20 @@ int syscall_handler_pre(uintptr_t syscall_no, uintptr_t *args, uint16_t *next_in
       }
       break;
     }
+#endif
+#ifdef DEBUG
+    // Ignore dup/2/3 if it attempts to redirect `stdout` or `stderr` during debugging.
+    // Otherwise debug messages may be redirected and not printed to your terminal.
+    case __NR_dup:
+      // dup does not actively redirect the stream, but it is often used to backup it
+      // before it is redirected e.g. with `freopen` to /dev/null (see procps-top).
+      if (args[0] == fileno(stdout) || args[0] == fileno(stderr))
+      do_syscall = 0;
+      break;
+    case __NR_dup3:
+      if (args[1] == fileno(stdout) || args[1] == fileno(stderr))
+      do_syscall = 0;
+      break;
 #endif
   }
 

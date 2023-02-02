@@ -34,4 +34,12 @@
   */
   #define SYSCALL_WRAPPER_STACK_OFFSET (2 + 2 + 22)
   #define SYSCALL_WRAPPER_FRAME_SIZE   (SYSCALL_WRAPPER_STACK_OFFSET + 2*32)
+#elif DBM_ARCH_RISCV64
+  /*
+   * +3   x1, x8 and x9 pushed by translation
+   * +17  push_volatile_syscall
+   * +13  push_fp_volatile
+   */
+  #define SYSCALL_WRAPPER_STACK_OFFSET (3 + 17)
+  #define SYSCALL_WRAPPER_FRAME_SIZE (SYSCALL_WRAPPER_STACK_OFFSET + 13)
 #endif

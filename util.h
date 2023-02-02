@@ -21,6 +21,25 @@
 #ifndef __DBM_UTIL_H__
 #define __DBM_UTIL_H__
 
+#include <stdint.h>
+#include <signal.h>
+
+#ifdef DBM_ARCH_RISCV64
+
+#define CTX_CLIENT 0
+#define CTX_MAMBO 1
+
+extern uintptr_t gp_tp_mambo_ctx_ptr;
+extern uintptr_t gp_shadow_ptr;
+extern uintptr_t tp_shadow_ptr;
+
+/**
+ * Switch register values of gp and tp with shadow values.
+ * @param switch_to_mambo_context If set, gp and tp are set to mambo context
+ */
+void mambo_gp_tp_context_switch(bool switch_to_mambo_context);
+#endif
+
 extern void dbm_client_entry(uintptr_t addr, uintptr_t *stack_top);
 extern uint32_t atomic_increment_u32(uint32_t *loc, uint32_t inc);
 extern uint64_t atomic_increment_u64(uint64_t *loc, uint64_t inc);
@@ -33,12 +52,14 @@ static inline int64_t atomic_increment_i64(int64_t *loc, int64_t inc) {
   return (int64_t)atomic_increment_u64((uint64_t *)loc, (uint64_t)inc);
 }
 #ifdef __arm__
-  #define atomic_increment_uptr(loc, inc) atomic_increment_u32(loc, inc);
+  #define atomic_increment_uptr(loc, inc) atomic_increment_u32(loc, inc)
 #elif __aarch64__
-  #define atomic_increment_uptr(loc, inc) atomic_increment_u64(loc, inc);
+  #define atomic_increment_uptr(loc, inc) atomic_increment_u64(loc, inc)
+#elif DBM_ARCH_RISCV64
+  #define atomic_increment_uptr(loc, inc) atomic_increment_u64(loc, inc)
 #endif
-#define atomic_increment_int(loc, inc) atomic_increment_i32(loc, inc);
-#define atomic_increment_uint(loc, inc) atomic_increment_u32(loc, inc);
+#define atomic_increment_int(loc, inc) atomic_increment_i32(loc, inc)
+#define atomic_increment_uint(loc, inc) atomic_increment_u32(loc, inc)
 
 // syscall() without errno handling
 extern uintptr_t raw_syscall(long number, ...);

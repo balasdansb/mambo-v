@@ -33,6 +33,10 @@
 #ifdef __aarch64__
 #define GET_INDEX(key) ((key >> 2) & (table->size - CODE_CACHE_HASH_OVERP))
 #endif
+#ifdef DBM_ARCH_RISCV64
+// Key shifted only 1 position due to 16 bit alignment
+#define GET_INDEX(key) ((key >> 1) & (table->size - CODE_CACHE_HASH_OVERP))
+#endif
 typedef struct {
   uintptr_t key;
   uintptr_t value;

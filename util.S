@@ -24,6 +24,104 @@
 .syntax unified
 #endif
 
+#include <asm/unistd.h>
+
+#ifdef DBM_ARCH_RISCV64
+.global push_volatile_regs
+push_volatile_regs:
+  /*
+   * Push volatile registers: x5-x7, x12-x18, x28-x31
+   * (x10 and x11 are expected to be pushed by the translation before)
+   */
+  # Move sp first, so that compressed instructions can be used
+  # (SD replaced with C.SDSP by assembler)
+  ADDI sp, sp, -112
+  SD x5, 104(sp)
+  SD x6, 96(sp)
+  SD x7, 88(sp)
+  SD x12, 80(sp)
+  SD x13, 72(sp)
+  SD x14, 64(sp)
+  SD x15, 56(sp)
+  SD x16, 48(sp)
+  SD x17, 40(sp)
+  SD x28, 32(sp)
+  SD x29, 24(sp)
+  SD x30, 16(sp)
+  SD x31, 8(sp)
+  # Load gp and tp of MAMBO context and store the client gp and tp
+  MV t3, ra
+  SD a0, 0(sp)
+  LI a0, 1
+  JAL mambo_gp_tp_context_switch
+  LD a0, 0(sp)
+  MV ra, t3
+  LD t3, 32(sp)
+  ADDI sp, sp, 8
+  RET
+
+.global pop_volatile_regs
+pop_volatile_regs:
+  /*
+   * Pop volatile registers: x5-x7, x12-x18, x28-x31
+   * (x10 and x11 are expected to be popped by the translation later)
+   */
+  # Store gp and tp of MAMBO context and load the client gp and tp
+  MV t3, ra
+  ADDI sp, sp, -8
+  SD a0, 0(sp)
+  MV a0, zero
+  JAL mambo_gp_tp_context_switch
+  LD a0, 0(sp)
+  MV ra, t3
+  LD x5, 104(sp)
+  LD x6, 96(sp)
+  LD x7, 88(sp)
+  LD x12, 80(sp)
+  LD x13, 72(sp)
+  LD x14, 64(sp)
+  LD x15, 56(sp)
+  LD x16, 48(sp)
+  LD x17, 40(sp)
+  LD x28, 32(sp)
+  LD x29, 24(sp)
+  LD x30, 16(sp)
+  LD x31, 8(sp)
+  ADDI sp, sp, 112
+  RET
+
+.global mambo_gp_tp_context_switch
+mambo_gp_tp_context_switch:
+  /* Switch register values of gp and tp with shadow values
+   * param a0: If set, gp and tp are set to mambo context
+   */
+  C.ADDI sp, -16
+  SD t0, 8(sp)
+  SD t1, 0(sp)
+
+  # Check context status
+  LD t0, gp_tp_mambo_ctx_ptr
+  LW t1, 0(t0)
+  BEQ a0, t1, 1f                # If context status is equal to requested context
+
+  XORI t1, t1, 1                # Toggle context status
+  SW t1, 0(t0)
+  LD t0, gp_shadow_ptr
+  LD t1, 0(t0)
+  SD gp, 0(t0)
+  MV gp, t1
+  LD t0, tp_shadow_ptr
+  LD t1, 0(t0)
+  SD tp, 0(t0)
+  MV tp, t1
+
+1:
+  LD t0, 8(sp)
+  LD t1, 0(sp)
+  C.ADDI sp, 16
+  RET
+#endif
+
 .global dbm_client_entry
 .func dbm_client_entry
 .type dbm_client_entry, %function
@@ -46,6 +144,20 @@ dbm_client_entry:
   MOV SP, X1
   STP XZR, XZR, [SP, #-16]!
   BR X0
+#endif
+
+#ifdef DBM_ARCH_RISCV64
+dbm_client_entry:
+  MV sp, a1
+  # Store gp and tp of MAMBO context
+  LD t0, gp_shadow_ptr
+  SD gp, 0(t0)
+  LD t0, tp_shadow_ptr
+  SD tp, 0(t0)
+  ADDI sp, sp, -16      # The scanner inserted code to pop a0 and a1, so push zeros before
+  SD zero, 0(sp)
+  SD zero, 8(sp)
+  JR a0
 #endif
 .endfunc
 
@@ -84,6 +196,43 @@ th_enter:
 
   BR X1
 #endif
+
+#ifdef DBM_ARCH_RISCV64
+th_enter:
+  MV sp, a0
+  # Load saved parent registers from child stack excluding sp (x2), a0 (x10) and a1 (x11).
+  # a0 and a1 are popped by the scanner.
+  LD x1, 0(sp)
+  LD x3, 16(sp)
+  LD x4, 24(sp)
+  LD x5, 32(sp)
+  LD x6, 40(sp)
+  LD x7, 48(sp)
+  LD x8, 56(sp)
+  LD x9, 64(sp)
+  LD x12, 88(sp)
+  LD x13, 96(sp)
+  LD x14, 104(sp)
+  LD x15, 112(sp)
+  LD x16, 120(sp)
+  LD x17, 128(sp)
+  LD x18, 136(sp)
+  LD x19, 144(sp)
+  LD x20, 152(sp)
+  LD x21, 160(sp)
+  LD x22, 168(sp)
+  LD x23, 176(sp)
+  LD x24, 184(sp)
+  LD x25, 192(sp)
+  LD x26, 200(sp)
+  LD x27, 208(sp)
+  LD x28, 216(sp)
+  LD x29, 224(sp)
+  LD x30, 232(sp)
+  LD x31, 240(sp)
+  ADDI sp, sp, 248
+  JR a1
+#endif
 .endfunc
 
 .global new_thread_trampoline
@@ -93,6 +242,7 @@ new_thread_trampoline:
 #ifdef __arm__
   PUSH {R4-R12, LR}
   MOV R1, SP
+  B dbm_start_thread_pth
 #elif __aarch64__
   STP X19, X20, [SP, #-96]!
   STP X21, X22, [SP, #16]
@@ -101,8 +251,13 @@ new_thread_trampoline:
   STP X27, X28, [SP, #64]
   STP X29, X30, [SP, #80]
   MOV X1, SP
-#endif
   B dbm_start_thread_pth
+#elif DBM_ARCH_RISCV64
+  # Save registers as part of the standard calling convention
+  JAL push_volatile_regs
+  MV a1, sp
+  J dbm_start_thread_pth
+#endif
 .endfunc
 
 .global return_with_sp
@@ -120,6 +275,11 @@ return_with_sp:
   LDP X27, X28, [SP, #64]
   LDP X29, X30, [SP, #80]
   LDP X19, X20, [SP], #96
+  RET
+#elif DBM_ARCH_RISCV64
+  MV sp, a0
+  # Restore registers as part of the standard calling convention
+  JAL pop_volatile_regs
   RET
 #endif
 .endfunc
@@ -151,6 +311,17 @@ raw_syscall:
   MOV X5, X6
   MOV X6, X7
   SVC 0
+  RET
+#endif
+#ifdef DBM_ARCH_RISCV64
+  MV a7, a0     # Set syscall number
+  MV a0, a1
+  MV a1, a2
+  MV a2, a3
+  MV a3, a4
+  MV a4, a5
+  MV a5, a6
+  ECALL
   RET
 #endif
 .endfunc
@@ -207,6 +378,32 @@ sigret:
   MOV X8, #139
   SVC 0
 #endif
+#ifdef DBM_ARCH_RISCV64
+  C.ADDI sp, -24
+  SD ra, 0(sp)
+  SD a1, 8(sp)
+  SD a0, 16(sp)
+  JAL push_volatile_regs
+  JAL push_fp_volatile
+  JAL signal_dispatcher
+  JAL pop_fp_volatile
+  JAL pop_volatile_regs
+  LD ra, 0(sp)
+  C.ADDI sp, 8
+
+  BEQZ a0, sigret
+  
+  JR a0
+sigret:
+  # Store client gp and tp in shadow regs because sigreturn restores the mambo context
+  # and when it does that, we want the client values in the shadow registers (otherwise
+  # we would loose them)
+  LI a0, 1        # a0 is not used for the syscall, so no store/restore required
+  JAL mambo_gp_tp_context_switch
+  C.ADDI sp, 16
+  LI a7, __NR_rt_sigreturn
+  ECALL
+#endif
 .endfunc
 
 .global atomic_increment_u64
@@ -239,6 +436,11 @@ retry:
   MOV X0, X2
   RET
 
+#elif DBM_ARCH_RISCV64
+  AMOADD.D zero, a1, (a0)
+  LD a0, 0(a0)
+  RET
+
 #endif
 .endfunc
 
@@ -262,6 +464,11 @@ atomic_increment_u32:
   STXR W3, W2, [X0]
   CBNZ W3, atomic_increment_u32
   MOV W0, W2
+  RET
+
+#elif DBM_ARCH_RISCV64
+  AMOADD.W zero, a1, (a0)
+  LW a0, 0(a0)
   RET
 
 #endif
@@ -301,9 +508,98 @@ abort:
   MOV W0, #-1
   RET
 
+#elif DBM_ARCH_RISCV64
+  LR.W.aq t1, (a0)
+  BLEZ t1, abort
+  SUB t1, t1, a1
+  SC.W.rl t2, t1, (a0)
+  BNEZ t2, atomic_decrement_if_positive_i32
+  MV a0, t1
+  RET
+abort:
+  SC.W zero, t1, (a0)
+  LI a0, -1
+  RET
+
 #endif
 .endfunc
 
+#ifdef DBM_ARCH_RISCV64
+push_all_but_params:
+  /*
+   * Push all registers but the function argument registers and sp and ra (x3-x9, x18-x31).
+   */
+  # Move sp first, so that compressed instructions can be used
+  # (SD replaced with C.SDSP by assembler)
+  ADDI    sp, sp, -176
+  SD      x3, 8(sp)
+  SD      x4, 16(sp)
+  SD      x5, 24(sp)
+  SD      x6, 32(sp)
+  SD      x7, 40(sp)
+  SD      x8, 48(sp)
+  SD      x9, 56(sp)
+  SD      x18, 64(sp)
+  SD      x19, 72(sp)
+  SD      x20, 80(sp)
+  SD      x21, 88(sp)
+  SD      x22, 96(sp)
+  SD      x23, 104(sp)
+  SD      x24, 112(sp)
+  SD      x25, 120(sp)
+  SD      x26, 128(sp)
+  SD      x27, 136(sp)
+  SD      x28, 144(sp)
+  SD      x29, 152(sp)
+  SD      x30, 160(sp)
+  SD      x31, 168(sp)
+  # Load gp and tp of MAMBO context and store the client gp and tp
+  MV s0, ra
+  SD a0, 0(sp)
+  LI a0, 1
+  JAL mambo_gp_tp_context_switch
+  MV ra, s0
+  LD a0, 0(sp)
+  LD s0, 176(sp)
+  ADDI sp, sp, 8
+  RET
+
+pop_all_but_params:
+  /*
+   * Pop all registers but the function argument registers and sp and ra (x3-x9, x18-x31).
+   */
+  # Store gp and tp of MAMBO context and load the client gp and tp
+  MV s0, ra
+  ADDI sp, sp, -8
+  SD a0, 0(sp)
+  MV a0, zero
+  JAL mambo_gp_tp_context_switch
+  LD a0, 0(sp)
+  MV ra, s0
+  # LD      x3, 8(sp)
+  # LD      x4, 16(sp)
+  LD      x5, 24(sp)
+  LD      x6, 32(sp)
+  LD      x7, 40(sp)
+  LD      x8, 48(sp)
+  LD      x9, 56(sp)
+  LD      x18, 64(sp)
+  LD      x19, 72(sp)
+  LD      x20, 80(sp)
+  LD      x21, 88(sp)
+  LD      x22, 96(sp)
+  LD      x23, 104(sp)
+  LD      x24, 112(sp)
+  LD      x25, 120(sp)
+  LD      x26, 128(sp)
+  LD      x27, 136(sp)
+  LD      x28, 144(sp)
+  LD      x29, 152(sp)
+  LD      x30, 160(sp)
+  LD      x31, 168(sp)
+  ADDI    sp, sp, 176
+  RET
+#endif
 
 .global safe_fcall_trampoline
 .func safe_fcall_trampoline
@@ -367,6 +663,18 @@ safe_fcall_trampoline:
   LDP X8,  X9,  [SP], #128
 
   RET
+
+#elif DBM_ARCH_RISCV64
+  C.ADDI sp, -8
+  SD ra, 0(sp)
+  JAL push_all_but_params
+  JAL push_fp_volatile
+  JALR x18          # function pointer
+  JAL pop_fp_volatile
+  JAL pop_all_but_params
+  LD ra, 0(sp)
+  C.ADDI sp, 8
+  RET
 #endif
 
 .endfunc
@@ -401,4 +709,27 @@ __try_memcpy_error:
 __try_memcpy_error:
   MOV X0, #-1
   RET
+#elif DBM_ARCH_RISCV64
+  LB t1, 0(a1)
+  SB t1, 0(a0)
+  C.ADDI a0, 1
+  C.ADDI a1, 1
+  ADDI a2, a2, -1
+  BNEZ a2, __try_memcpy_error
+  LI a0, 0
+  RET
+
+__try_memcpy_error:
+  LI a0, -1
+  RET
 #endif
+
+.data
+.global gp_tp_mambo_ctx_ptr
+gp_tp_mambo_ctx_ptr: .dword 0
+
+.global gp_shadow_ptr
+gp_shadow_ptr: .dword 0
+
+.global tp_shadow_ptr
+tp_shadow_ptr: .dword 0

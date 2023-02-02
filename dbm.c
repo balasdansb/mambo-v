@@ -45,7 +45,7 @@
 #endif
 
 #ifdef DEBUG
-  #define debug(...) fprintf(stderr, __VA_ARGS__)
+  #define debug(...) log("dbm", __VA_ARGS__)
   #ifndef VERBOSE
     #define VERBOSE
   #endif
@@ -54,7 +54,7 @@
 #endif
 
 #ifdef VERBOSE
-  #define info(...) fprintf(stderr, __VA_ARGS__)
+  #define info(...) log("dbm", __VA_ARGS__)
 #else
   #define info(...)
 #endif
@@ -64,6 +64,11 @@
 #define dispatcher_wrapper_offset     ((uintptr_t)dispatcher_trampoline - (uintptr_t)&start_of_dispatcher_s)
 #define syscall_wrapper_offset        ((uintptr_t)syscall_wrapper - (uintptr_t)&start_of_dispatcher_s)
 #define trace_head_incr_offset        ((uintptr_t)trace_head_incr - (uintptr_t)&start_of_dispatcher_s)
+#ifdef DBM_ARCH_RISCV64
+  #define gp_tp_mambo_ctx_offset        ((uintptr_t)&gp_tp_mambo_ctx - (uintptr_t)&start_of_dispatcher_s)
+  #define gp_shadow_offset              ((uintptr_t)&gp_shadow - (uintptr_t)&start_of_dispatcher_s)
+  #define tp_shadow_offset              ((uintptr_t)&tp_shadow - (uintptr_t)&start_of_dispatcher_s)
+#endif
 
 uintptr_t page_size;
 dbm_global global_data;
@@ -231,17 +236,30 @@ uintptr_t scan(dbm_thread *thread_data, uint16_t *address, int basic_block) {
 #ifdef __aarch64__
   block_size = scan_a64(thread_data, (uint32_t *)address, basic_block, mambo_bb, NULL);
 #endif
+#ifdef DBM_ARCH_RISCV64
+  block_size = scan_riscv(thread_data, (uint16_t *)address, basic_block, mambo_bb, NULL);
+#endif
 
 #ifdef __arm__
   inst_set inst_type = thumb ? THUMB_INST : ARM_INST;
 #elif __aarch64__
   inst_set inst_type = A64_INST;
+#elif DBM_ARCH_RISCV64
+  inst_set inst_type = RISCV64_INST;
 #endif
   bool stop = true;
+  mambo_cond cond;
+#ifdef DBM_ARCH_RISCV64
+  cond.cond = AL;
+  cond.r1 = x0;
+  cond.r2 = x0;
+#else
+  cond = -1;
+#endif
   mambo_deliver_callbacks_code(POST_BB_C, thread_data, mambo_bb, basic_block, inst_type,
-                               -1, -1, address, (void *)(block_address & (~THUMB)), NULL, &stop);
+                               -1, cond, address, (void *)(block_address & (~THUMB)), NULL, &stop);
   mambo_deliver_callbacks_code(POST_FRAGMENT_C, thread_data, mambo_bb, basic_block, inst_type,
-                               -1, -1, address, (void *)(block_address & (~THUMB)), NULL, &stop);
+                               -1, cond, address, (void *)(block_address & (~THUMB)), NULL, &stop);
   assert(stop == true);
 
   // Flush modified instructions from caches
@@ -430,6 +448,9 @@ void init_thread(dbm_thread *thread_data) {
   uint32_t *write_p = (uint32_t *)(thread_data->trace_head_incr_addr + 4);
   a64_copy_to_reg_64bits(&write_p, x2, (uintptr_t)thread_data->exec_count);
   #endif
+  #ifdef DBM_ARCH_RISCV64
+  // TODO: RISC-V traces
+  #endif
 
   info("Traces start at: %p\n", &thread_data->code_cache->traces);
 #endif // DBM_TRACES
@@ -441,7 +462,7 @@ void init_thread(dbm_thread *thread_data) {
 
   thread_data->status = THREAD_RUNNING;
                         
-  debug("Syscall wrapper addr: 0x%x\n", thread_data->syscall_wrapper_addr);
+  debug("Syscall wrapper addr: %p\n", thread_data->syscall_wrapper_addr);
 }
 
 void free_all_other_threads(dbm_thread *thread_data) {
@@ -490,6 +511,7 @@ bool is_bb(dbm_thread *thread_data, uintptr_t addr) {
 int addr_to_bb_id(dbm_thread *thread_data, uintptr_t addr) {
   uintptr_t min = (uintptr_t)thread_data->code_cache->blocks;
   uintptr_t max = (uintptr_t)thread_data->code_cache->traces;
+  assert(min < max);
 
   if (addr < min || addr > max) {
     return -1;
@@ -606,7 +628,67 @@ void notify_vm_op(vm_op_t op, uintptr_t addr, size_t size, int prot, int flags, 
 #endif
 }
 
+#ifndef DBM_TEST
 void main(int argc, char **argv, char **envp) {
+#ifdef DEBUG
+  // Setup logging
+  log_create("common", LOG_STDERR);
+  log_create("dbm", LOG_STDERR);
+  log_create("dispatcher", LOG_STDERR);
+  log_create("signals", LOG_STDERR);
+  log_create("syscalls", LOG_STDERR);
+  log_create("traces", LOG_STDERR);
+#ifdef __arm__
+  log_create("dispatcher_aarch32", LOG_STDERR);
+  log_create("scanner_a32", LOG_STDERR);
+  log_create("scanner_t32", LOG_STDERR);
+#elif defined(__aarch64__)
+  log_create("dispatcher_aarch64", LOG_STDERR);
+  log_create("scanner_a64", LOG_STDERR);
+#elif defined(DBM_ARCH_RISCV64)
+  log_create("dispatcher_riscv", LOG_STDERR);
+  log_create("scanner_riscv", LOG_STDERR);
+#endif
+
+  log_open("common", "w");
+  log_open("dbm", "w");
+  log_open("dispatcher", "w");
+  log_open("signals", "w");
+  log_open("syscalls", "w");
+  log_open("traces", "w");
+#ifdef __arm__
+  log_open("dispatcher_aarch32", "w");
+  log_open("scanner_a32", "w");
+  log_open("scanner_t32", "w");
+#elif defined(__aarch64__)
+  log_open("dispatcher_aarch64", "w");
+  log_open("scanner_a64", "w");
+#elif defined(DBM_ARCH_RISCV64)
+  log_open("dispatcher_riscv", "w");
+  log_open("scanner_riscv", "w");
+#endif
+
+  // Create logfile for all
+  FILE *all_log = log_open_raw_fp("debug", "w");
+  log_set_secondary_fp("common", all_log);
+  log_set_secondary_fp("dbm", all_log);
+  log_set_secondary_fp("dispatcher", all_log);
+  log_set_secondary_fp("signals", all_log);
+  log_set_secondary_fp("syscalls", all_log);
+  log_set_secondary_fp("traces", all_log);
+#ifdef __arm__
+  log_set_secondary_fp("dispatcher_aarch32", all_log);
+  log_set_secondary_fp("scanner_a32", all_log);
+  log_set_secondary_fp("scanner_t32", all_log);
+#elif defined(__aarch64__)
+  log_set_secondary_fp("dispatcher_aarch64", all_log);
+  log_set_secondary_fp("scanner_a64", all_log);
+#elif defined(DBM_ARCH_RISCV64)
+  log_set_secondary_fp("dispatcher_riscv", all_log);
+  log_set_secondary_fp("scanner_riscv", all_log);
+#endif
+#endif
+
   Elf *elf = NULL;
   
   if (argc < 2) {
@@ -636,7 +718,7 @@ void main(int argc, char **argv, char **envp) {
   struct elf_loader_auxv auxv;
   uintptr_t entry_address;
   load_elf(argv[1], &elf, &auxv, &entry_address, false);
-  debug("entry address: 0x%x\n", entry_address);
+  debug("entry address: %p\n", entry_address);
 
   // Set up brk emulation
   ret = pthread_mutex_init(&global_data.brk_mutex, NULL);
@@ -660,7 +742,13 @@ void main(int argc, char **argv, char **envp) {
   uintptr_t block_address = scan(thread_data, (uint16_t *)entry_address, ALLOCATE_BB);
   debug("Address of first basic block is: 0x%x\n", block_address);
 
+#ifdef DBM_ARCH_RISCV64
+  gp_tp_mambo_ctx_ptr = (uintptr_t)&thread_data->code_cache[0] + gp_tp_mambo_ctx_offset;
+  gp_shadow_ptr = (uintptr_t)&thread_data->code_cache[0] + gp_shadow_offset;
+  tp_shadow_ptr = (uintptr_t)&thread_data->code_cache[0] + tp_shadow_offset;
+#endif
+
   #define ARGDIFF 2
   elf_run(block_address, argv[1], argc-ARGDIFF, &argv[ARGDIFF], envp, &auxv);
 }
-
+#endif
